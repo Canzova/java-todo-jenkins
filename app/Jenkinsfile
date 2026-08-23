@@ -26,60 +26,75 @@ pipeline {
         }
 
         // Stage 2: Run automated tests (GitHub Actions equivalent -> run: ./mvnw test)
-        // chmod +x ./mvnw is necessary to make the Maven wrapper executable in Jenkins, as it may not have execute permissions by default.
         stage("Test") {
             steps {
-                sh '''
-                    chmod +x ./mvnw
-                    ./mvnw test
-                '''
+                // dir('app'): Switches working directory to 'app' because the Java application source code,
+                // pom.xml, and Maven wrapper (./mvnw) are located in the 'app' subdirectory rather than the repo root.
+                // chmod +x ./mvnw ensures the Maven wrapper script has executable permissions in Jenkins.
+                dir('app') {
+                    sh '''
+                        chmod +x ./mvnw
+                        ./mvnw test
+                    '''
+                }
             }
         }
 
         // Stage 3: Compile & package JAR without tests (GitHub Actions equivalent -> run: ./mvnw clean package)
         stage("Build") {
             steps {
-                sh '''
-                    ./mvnw clean package -DskipTests
-                '''
+                // dir('app'): Runs Maven packaging inside 'app' to resolve dependencies, read pom.xml,
+                // and output the packaged JAR file into 'app/target/'.
+                dir('app') {
+                    sh '''
+                        ./mvnw clean package -DskipTests
+                    '''
+                }
             }
         }
 
         // Stage 4: Build Docker image (GitHub Actions equivalent -> run: docker build ...)
         stage("Docker Build") {
             steps {
-                sh '''
-                    docker build \
-                    -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
-                '''
+                // dir('app'): Sets the Docker build context to 'app' where both the Dockerfile and the
+                // compiled JAR artifact (target/app-*.jar) reside.
+                dir('app') {
+                    sh '''
+                        docker build \
+                        -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
+                    '''
+                }
             }
         }
 
         // Stage 5: Authenticate & push to Docker Hub (GitHub Actions equivalent -> uses: docker/login-action with ${{ secrets.DOCKER_PASSWORD }})
         stage("Docker Push") {
             steps {
-                // withCredentials: Binds Jenkins Secret Store credentials to environment variables safely
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-credentials',
-                        usernameVariable: 'DOCKERHUB_USERNAME',
-                        passwordVariable: 'DOCKERHUB_PASSWORD'
-                    )
-                ]) {
-                    sh '''
-                        # Secure login via stdin
-                        echo "$DOCKERHUB_PASSWORD" | docker login \
-                        -u $DOCKERHUB_USERNAME \
-                        --password-stdin
+                // dir('app'): Executes within 'app' for consistency with previous stages.
+                dir('app') {
+                    // withCredentials: Binds Jenkins Secret Store credentials to environment variables safely
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'dockerhub-credentials',
+                            usernameVariable: 'DOCKERHUB_USERNAME',
+                            passwordVariable: 'DOCKERHUB_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            # Secure login via stdin
+                            echo "$DOCKERHUB_PASSWORD" | docker login \
+                            -u $DOCKERHUB_USERNAME \
+                            --password-stdin
 
-                        # Push tagged image to registry
-                        docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
+                            # Push tagged image to registry
+                            docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
 
-                        # Clean up dangling images to save disk space
-                        docker image prune -af 
-                        
-                        docker images
-                    '''
+                            # Clean up dangling images to save disk space
+                            docker image prune -af 
+                            
+                            docker images
+                        '''
+                    }
                 }
             }
         }
