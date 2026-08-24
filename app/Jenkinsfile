@@ -1,3 +1,4 @@
+// dir(/app): The Java application source code, pom.xml, and Maven wrapper (./mvnw) are located in the 'app' subdirectory rather than the repo root. This directive changes the working directory to 'app' for all enclosed steps, ensuring that commands like ./mvnw test and ./mvnw clean package execute in the correct context where the necessary files are present.
 pipeline {
     // Agent: Defines where pipeline runs (GitHub Actions equivalent -> runs-on: ubuntu-latest)
     agent any 
@@ -7,7 +8,7 @@ pipeline {
         PROJECT_NAME     = "todo-backend"
         DOCKER_IMAGE     = "canzova/simple-todo-backend"
         DOCKER_TAG       = "${BUILD_NUMBER}"  // Auto-increment build ID (GHA: ${{ github.run_number }})
-        EC2_HOST         = "13.232.204.108"
+        EC2_HOST         = "43.204.131.218"
         EC2_USER         = "ubuntu"
         DOCKER_CONTAINER = "todo-backend"
         APP_PORT         = "8082:8080"
@@ -98,5 +99,54 @@ pipeline {
                 }
             }
         }
+
+        // Stage 6: Manual approval gate before deployment (prevents accidental production releases)
+        stage("Production Approval") {
+            steps {
+                // input: Pauses pipeline execution and waits for human confirmation/approval in Jenkins UI
+                input message: 'Deploy to production?'
+            }
+        }
+
+        // Stage 7: Deploy application to remote EC2 production server via SSH & Docker
+        stage("EC2 Deploy - production server") {
+            steps {
+                // sshagent: Loads SSH private key from Jenkins Credentials ('ec2-instance-key') for passwordless SSH authentication
+                sshagent([
+                    'ec2-instance-key'
+                ]) {
+                    sh '''
+                        # Ensure ~/.ssh directory exists on Jenkins agent (-p avoids error if already present)
+                        mkdir -p ~/.ssh
+
+                        # Restrict permissions to owner only (required by SSH for security)
+                        chmod 700 ~/.ssh
+
+                        # Fetch and append EC2 public host key to known_hosts to prevent interactive host verification prompt
+                        ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+                        # Connect to remote EC2 instance via SSH and run deployment commands remotely
+                        ssh $EC2_USER@$EC2_HOST "
+                            # Force-stop and remove existing container; '|| true' prevents failure if container doesn't exist
+                            docker rm -f $DOCKER_CONTAINER || true
+
+                            # Pull the latest built image tag from Docker Hub
+                            docker pull $DOCKER_IMAGE:$DOCKER_TAG
+
+                            # Run container in background (-d), map ports (-p), and restart automatically if it crashes
+                            docker run -d \
+                                --name $DOCKER_CONTAINER \
+                                -p $APP_PORT \
+                                --restart unless-stopped \
+                                $DOCKER_IMAGE:$DOCKER_TAG
+
+                            # Clean up old/unused images on EC2 host to free up disk space (-f bypasses prompt)
+                            docker image prune -f
+                        "
+                    '''
+                }
+            }
+        }
+
     }
 }
