@@ -111,9 +111,9 @@ pipeline {
         // Stage 7: Deploy application to remote EC2 production server via SSH & Docker
         stage("EC2 Deploy - production server") {
             steps {
-                // sshagent: Loads SSH private key from Jenkins Credentials ('ec2-instance-key') for passwordless SSH authentication
+                // sshagent: Loads SSH private key from Jenkins Credentials ('ec2-ssh-credentials') for passwordless SSH authentication
                 sshagent([
-                    'ec2-instance-key'
+                    'ec2-ssh-credentials'
                 ]) {
                     sh '''
                         # Ensure ~/.ssh directory exists on Jenkins agent (-p avoids error if already present)
