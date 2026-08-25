@@ -558,6 +558,76 @@ Setting up the webhook isn't enough by itself — you also need to tell the spec
 
 **One thing to check:** GitHub (out on the internet) needs to be able to reach your EC2 machine on port 8080 for step 2 to work — so your EC2 **Security Group** must allow that port in, same as what lets you open the Jenkins website yourself.
 
+### 4.9 Production Approval stage (a safety checkpoint before deploying)
+
+```groovy
+stage("Production Approval "){
+    steps{
+        input message: 'Deploy to production?'
+    }
+}
+```
+
+This stage simply **pauses the pipeline** and shows a button on the Jenkins website asking "Deploy to production?" Jenkins won't do anything else until a real person clicks "Proceed" (or "Abort" to cancel). It's a safety checkpoint so nothing gets deployed to your live server automatically, without a human saying yes first.
+
+### 4.10 EC2 Deploy stage (actually deploying to the production server)
+
+```groovy
+stage("EC2 Deploy- production server")
+{
+    steps{
+        sshagent([
+            'ec2-instance-key'
+        ]){
+            sh '''
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+            ssh $EC2_USER@$EC2_HOST "
+                docker rm -f $DOCKER_CONTAINER || true
+                docker pull $DOCKER_IMAGE:$DOCKER_TAG
+                docker run -d \
+                    --name $DOCKER_CONTAINER \
+                    -p $APP_PORT \
+                    --restart unless-stopped \
+                    $DOCKER_IMAGE:$DOCKER_TAG
+                docker image prune -f
+            "
+            '''
+        }
+    }
+}
+```
+
+- `sshagent(['ec2-instance-key'])` — loads a saved SSH key (from Jenkins credentials, named `ec2-instance-key`) so the commands inside can log into the EC2 machine, without needing a password typed in.
+
+> **Note: in this setup, Jenkins and the app run on the *same* EC2 machine.** `EC2_HOST` in the Jenkinsfile should be set to that same server's address (the `13.204.45.50` shown in the example Jenkinsfile is just a placeholder/typo value — update it to match your real EC2 IP). Even though it's the same physical machine, SSH still treats this as a brand-new connection the first time — it doesn't know or care that it's "the same computer" in a physical sense, so the trust step below is still needed. Writing the deploy step this way (SSH into the target server, rather than running Docker commands directly) also means the exact same Jenkinsfile would keep working unchanged if you ever moved the app to a separate production server later — you'd just update `EC2_HOST`.
+
+- `mkdir -p ~/.ssh` — creates a folder called `.ssh`, where SSH keeps its list of "servers I trust." `mkdir` means "make folder," and `-p` means "don't complain if it already exists." Without this folder, SSH would have nowhere to save that trust-list in the next step.
+
+- `chmod 700 ~/.ssh` — locks down that folder so only the current user can open it. This might seem unusual, but SSH is strict about security: it actually **refuses to work** if it sees that its folder could be opened by other users on the machine — like a bank refusing to use a vault whose door was left open for anyone to see inside. `chmod` means "change who's allowed to access this," and `700` means "only the owner can read, write, or open it — nobody else."
+
+- `ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts` — this one needs a small story to make sense. Whenever you connect to **any** server over the internet for the very first time — for any reason, not just deploying — how do you really know you're talking to the actual server you meant to reach, and not some fake pretending to be it? SSH solves this by having every server show a unique "identity card" the first time you connect, and SSH wants confirmation that this really is the server it's supposed to be, before continuing. Normally, a person looks at that identity card and manually types "yes, I trust this" the first time. Since nobody's sitting there to approve it during an automatic pipeline, we pre-approve it ourselves with this line — telling SSH ahead of time, "I already know and trust this specific server's identity, so connect without stopping to ask me."
+  - `ssh-keyscan` = a small tool whose only job is "go get a server's identity card"
+  - `-H` = hides/scrambles the server's address in the saved file, for extra privacy
+  - `"$EC2_HOST"` = the production server's address (e.g. `13.204.45.50`)
+  - `>>` = "add this to the end of the file" (instead of replacing everything already in it)
+  - `~/.ssh/known_hosts` = the specific file SSH checks to see which servers it already trusts
+
+**In short, these 3 lines exist only to make the real connection (the `ssh $EC2_USER@$EC2_HOST "..."` line right after) run smoothly and automatically, without Jenkins ever getting stuck waiting for a "do you trust this?" prompt that no human is there to answer.** This "trust" check isn't special to deploying an app — it's just the normal, standard way SSH behaves the first time any two machines connect to each other at all; it just happens to be your production server in this case.
+
+- `ssh $EC2_USER@$EC2_HOST "..."` — connects to your production EC2 server, and everything inside the quotes runs **on that server**, not on the Jenkins machine. This is the actual deployment step. Inside it:
+  - `docker rm -f $DOCKER_CONTAINER || true` — deletes the currently running container (the old version of the app), if there is one, so it can be replaced. `|| true` means "if this fails (e.g. there was nothing to delete), don't treat it as an error — just carry on."
+  - `docker pull $DOCKER_IMAGE:$DOCKER_TAG` — downloads the exact image that was just built and uploaded earlier in the pipeline (since `DOCKER_TAG` is the build number, this always grabs the newest one).
+  - `docker run -d --name $DOCKER_CONTAINER -p $APP_PORT --restart unless-stopped $DOCKER_IMAGE:$DOCKER_TAG` — starts the new version:
+    - `-d` — run it in the background.
+    - `--name $DOCKER_CONTAINER` — give it a name (so the next deploy knows what to remove).
+    - `-p $APP_PORT` — connects the app's port to the outside world.
+    - `--restart unless-stopped` — keeps it running automatically, even through a server reboot.
+  - `docker image prune -f` — deletes old, unused Docker images on the server to save disk space. `-f` skips the "are you sure?" confirmation.
+
+**In short:** this stage logs into your real production server, removes the old running version of the app, downloads the brand-new image that was just built, and starts it up in its place — set to survive reboots, with old leftovers cleaned up along the way.
+
 ---
 
 ## 5. Plugins & Integrations
@@ -568,7 +638,76 @@ Setting up the webhook isn't enough by itself — you also need to tell the spec
 
 ## 6. Advanced Topics
 
-*(To be filled in as we go)*
+### 6.1 Running a pipeline automatically for certain branches (`feature-*`, `release-*`)
+
+**The simple idea:** so far, your Jenkins job only watches one fixed branch (like `main`). In real teams, people create lots of branches — `feature-login`, `feature-payment`, `release-1.0`, etc. You want: "any time someone pushes to a branch starting with `feature-` or `release-`, automatically run the pipeline for that branch too" — without manually creating a new Jenkins job every time someone makes a branch.
+
+**The Jenkins feature for this: a "Multibranch Pipeline"**
+
+- A normal **Pipeline** job = watches exactly one fixed branch, forever.
+- A **Multibranch Pipeline** job = keeps looking at your whole repo, and automatically creates a mini-pipeline for every branch that matches a pattern you give it — with no extra clicking needed from you.
+
+So if you push a new branch called `feature-login`, Jenkins notices it by itself, sees it matches your pattern, and starts running its pipeline automatically.
+
+**How to set it up:**
+1. Jenkins homepage → **New Item**
+2. Give it a name, choose **Multibranch Pipeline**, click OK
+3. Under **Branch Sources**, click **Add source → GitHub** (or Git), and give your repo URL + credentials
+4. Below that, under **Behaviours**, add **"Filter by name (with wildcards)"**, and type:
+   ```
+   feature-* release-*
+   ```
+   (space-separated — meaning "match anything starting with `feature-` OR `release-`")
+5. Save.
+
+Jenkins will scan the repo, find any branch matching those patterns, and automatically build/run a pipeline for each one, using the Jenkinsfile on that branch.
+
+### 6.2 Deploying to different environments based on Git tags (`dev-*`, `sit-*`, `sat-*`, `prd-*`)
+
+**What is a "tag," in simple terms?** A tag is a label you stick onto one specific point in your code's history — like a sticky note on a page saying "this exact version is final." Unlike a branch (which keeps moving as new commits are added), a tag stays fixed. Teams often tag a specific commit as `dev-1.0` or `prd-2.3` to mark "this is the exact version we're deploying."
+
+**The goal:** if someone adds a tag starting with `dev-`, deploy to the Dev server. `sit-` → SIT. `sat-` → UAT. `prd-` → Production. One pipeline, but it picks the destination based on the tag's name.
+
+**Step 1 — make Jenkins notice tags at all.** By default, a Multibranch Pipeline only looks at branches, not tags:
+1. Open the Multibranch Pipeline job → **Configure**
+2. Under **Behaviours**, click **Add → Discover tags**
+3. Save
+
+Now Jenkins reacts to new tags being pushed, the same way it reacts to new branches.
+
+**Step 2 — Jenkins tells your Jenkinsfile which tag triggered the build.** Whenever a build starts because of a tag, Jenkins automatically provides a value called `env.TAG_NAME`, holding the exact tag name (e.g. `dev-1.0`).
+
+**Step 3 — use that tag name to pick the right environment**, inside your deploy stage:
+
+```groovy
+stage('Deploy') {
+    steps {
+        script {
+            if (env.TAG_NAME?.startsWith('dev-')) {
+                echo "Deploying to DEV environment"
+                // dev deploy commands here
+            } else if (env.TAG_NAME?.startsWith('sit-')) {
+                echo "Deploying to SIT environment"
+                // sit deploy commands here
+            } else if (env.TAG_NAME?.startsWith('sat-')) {
+                echo "Deploying to UAT environment"
+                // uat deploy commands here
+            } else if (env.TAG_NAME?.startsWith('prd-')) {
+                echo "Deploying to PRODUCTION environment"
+                // production deploy commands here
+            } else {
+                echo "This tag doesn't match any known environment — skipping deploy"
+            }
+        }
+    }
+}
+```
+
+In plain words: *look at the tag's name — if it starts with `dev-`, run the dev deploy steps; if it starts with `sit-`, run the sit ones, and so on.* Each branch of this `if`/`else if` would contain the same kind of `sshagent` + `ssh` deploy commands explained in section 4.10 — just pointed at a different server/environment each time.
+
+**Putting both ideas together, simply:**
+- **Branches** (`feature-*`, `release-*`) → Jenkins automatically **builds/tests** code as people work on it, one pipeline per branch.
+- **Tags** (`dev-*`, `sit-*`, `sat-*`, `prd-*`) → Jenkins automatically **deploys** a specific, finished version to the right environment, based on what the tag is named.
 
 ---
 
@@ -810,6 +949,35 @@ steps{
             
             docker images
         '''
+    }
+}
+}
+stage("Production Approval "){
+steps{
+    input message: 'Deploy to production?'
+}
+}
+stage("EC2 Deploy- production server")
+{
+steps{
+    sshagent([
+        'ec2-instance-key'
+    ]){
+          sh '''
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+            ssh $EC2_USER@$EC2_HOST "
+                docker rm -f $DOCKER_CONTAINER || true
+                docker pull $DOCKER_IMAGE:$DOCKER_TAG
+                docker run -d \
+                    --name $DOCKER_CONTAINER \
+                    -p $APP_PORT \
+                    --restart unless-stopped \
+                    $DOCKER_IMAGE:$DOCKER_TAG
+                docker image prune -f
+            "
+'''
     }
 }
 }
